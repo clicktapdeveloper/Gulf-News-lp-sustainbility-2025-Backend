@@ -1,0 +1,87 @@
+/* Gulf News Email Template Color Variables */
+/* This file provides consistent color definitions for all email templates */
+
+:root {
+  /* Gulf News Brand Colors */
+  --gulf-background: #EBF1E7;        /* Light sage green - Main background */
+  --gulf-primary: #DBE2CD;           /* Soft sage green - Navbar/header background */
+  --gulf-secondary: #224442;         /* Dark teal green - Primary text and accents */
+  --gulf-tertiary: #000000;          /* Black - Body text */
+  --gulf-white: #FFFFFF;             /* Pure white - Text on dark backgrounds */
+  --gulf-card: #E7FB7A;              /* Light lime green - Highlight cards */
+  --gulf-border: #00000040;          /* Black with 25% opacity - Subtle borders */
+}
+
+/* Email Template Color Classes */
+.gulf-bg-main {
+  background-color: var(--gulf-background);
+}
+
+.gulf-bg-primary {
+  background-color: var(--gulf-primary);
+}
+
+.gulf-bg-card {
+  background-color: var(--gulf-card);
+}
+
+.gulf-bg-white {
+  background-color: var(--gulf-white);
+}
+
+.gulf-text-primary {
+  color: var(--gulf-secondary);
+}
+
+.gulf-text-body {
+  color: var(--gulf-tertiary);
+}
+
+.gulf-text-white {
+  color: var(--gulf-white);
+}
+
+.gulf-border-subtle {
+  border-color: var(--gulf-border);
+}
+
+/* Gradient Backgrounds */
+.gulf-gradient-header {
+  background: linear-gradient(135deg, var(--gulf-secondary) 0%, var(--gulf-primary) 100%);
+}
+
+.gulf-gradient-button {
+  background: linear-gradient(135deg, var(--gulf-secondary) 0%, var(--gulf-primary) 100%);
+}
+
+/* Accessibility and Contrast Guidelines */
+/*
+Color Contrast Ratios (WCAG AA compliant):
+- #224442 on #EBF1E7: High contrast (meets WCAG AA standards)
+- #000000 on #EBF1E7: High contrast (meets WCAG AA standards)
+- #224442 on #DBE2CD: Good contrast for interactive elements
+- #FFFFFF on #224442: High contrast for text on dark backgrounds
+*/
+
+/* Usage Examples for Email Templates */
+/*
+Header Section:
+background: linear-gradient(135deg, #224442 0%, #DBE2CD 100%);
+color: #FFFFFF;
+
+Card Backgrounds:
+background-color: #E7FB7A;
+
+Primary Text:
+color: #224442;
+
+Body Text:
+color: #000000;
+
+Subtle Borders:
+border: 1px solid #00000040;
+
+Interactive Elements:
+background-color: #224442;
+color: #FFFFFF;
+*/

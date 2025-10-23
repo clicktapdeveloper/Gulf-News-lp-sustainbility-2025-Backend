@@ -1,0 +1,45 @@
+{
+  "name": "event-ticketing-backend",
+  "version": "1.0.1",
+  "description": "Backend server for Event Ticketing application with Stripe and CyberSource payments, MongoDB, and email notifications",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "event",
+    "ticketing",
+    "stripe",
+    "cybersource",
+    "payments",
+    "mongodb",
+    "express",
+    "backend",
+    "api"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.914.0",
+    "cors": "^2.8.5",
+    "cybersource-rest-client": "^0.0.53",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jwk-to-pem": "^2.0.7",
+    "mongodb": "^5.9.0",
+    "multer": "^2.0.2",
+    "nodemailer": "^6.9.17",
+    "qrcode": "^1.5.4",
+    "stripe": "^17.6.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  }
+}
