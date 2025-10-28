@@ -7,10 +7,18 @@ import crypto from 'crypto';
 import multer from 'multer';
 import Stripe from 'stripe';
 import QRCode from 'qrcode';
+import { ObjectId } from 'mongodb';
 import clientPromise from './utils/mongodb.js';
 import { sendEmail } from './utils/mailer.js';
 import { createCardPayment, CyberSourceClient } from './utils/cybersource.js';
 import { createS3Service } from './utils/s3.js';
+import { 
+  createPaymentParams, 
+  createCyberSourceForm, 
+  processPaymentResponse, 
+  validateCyberSourceConfig,
+  getCyberSourceUrl
+} from './utils/cybersource-hosted.js';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -24,13 +32,47 @@ const FRONTEND_URLS = (process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 
 
 // Sensible local defaults if env not set
 if (FRONTEND_URLS.length === 0) {
-  FRONTEND_URLS.push('http://localhost:5173', 'http://localhost:3000', 'https://gulf-news-vite.vercel.app');
+  FRONTEND_URLS.push('http://localhost:5173', 'http://localhost:3000', 'https://gulf-news-vite.vercel.app', 'https://gulf-news-lp-sustainbility-2025-fro.vercel.app', 'https://www.gulfnews-events.com', 'https://gulfnews-events.com');
 }
+
+// Always ensure both www and non-www versions are included for gulfnews-events.com
+const gulfNewsDomains = ['https://gulfnews-events.com', 'https://www.gulfnews-events.com'];
+gulfNewsDomains.forEach(domain => {
+  if (!FRONTEND_URLS.includes(domain)) {
+    FRONTEND_URLS.push(domain);
+  }
+});
+
+console.log('Final FRONTEND_URLS configuration:', FRONTEND_URLS);
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion: '2023-10-16' });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Fail-safe CORS headers for all /api routes (in case upstream/proxy interferes)
+app.use('/api', (req, res, next) => {
+  const origin = req.headers.origin;
+  const isGulfNewsDomain = origin && (
+    origin.includes('gulfnews-events.com') ||
+    origin.includes('www.gulfnews-events.com')
+  );
+
+  if (!origin || FRONTEND_URLS.includes(origin) || isGulfNewsDomain) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+    res.header('Access-Control-Allow-Headers', 'Accept, Content-Type, Authorization, X-Requested-With');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Max-Age', '86400');
+    res.header('Vary', 'Origin');
+
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+  }
+
+  return next();
+});
 
 // Multer configuration for file uploads
 const storage = multer.memoryStorage();
@@ -57,23 +99,162 @@ const upload = multer({
 app.use(
   cors({
     origin(origin, cb) {
+      console.log('CORS Origin check:', origin);
+      console.log('Allowed origins:', FRONTEND_URLS);
+      
       // allow non-browser requests (curl/postman) with no origin
-      if (!origin) return cb(null, true);
-      return cb(null, FRONTEND_URLS.includes(origin));
+      if (!origin) {
+        console.log('No origin provided, allowing request');
+        return cb(null, true);
+      }
+      
+      // Always allow gulfnews-events.com domains
+      const isGulfNewsDomain = origin.includes('gulfnews-events.com');
+      const isAllowed = FRONTEND_URLS.includes(origin) || isGulfNewsDomain;
+      
+      console.log('Origin allowed:', isAllowed, 'isGulfNewsDomain:', isGulfNewsDomain);
+      
+      return cb(null, isAllowed);
     },
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+    allowedHeaders: ['Accept', 'Content-Type', 'Authorization', 'X-Requested-With'],
     credentials: true, // keep true only if you actually use cookies
     optionsSuccessStatus: 204,
   })
 );
 
-// (Optional) handle explicit preflights
-app.options('*', cors());
+// Additional CORS middleware specifically for nomination endpoints
+app.use('/api/nomination', (req, res, next) => {
+  const origin = req.headers.origin;
+  console.log('Nomination endpoint CORS check - Origin:', origin);
+  console.log('Nomination endpoint CORS check - Allowed origins:', FRONTEND_URLS);
+  
+  // Always allow gulfnews-events.com domains
+  const isGulfNewsDomain = origin && (
+    origin.includes('gulfnews-events.com') || 
+    origin.includes('www.gulfnews-events.com')
+  );
+  
+  if (!origin || FRONTEND_URLS.includes(origin) || isGulfNewsDomain) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Max-Age', '86400');
+    
+    console.log('CORS headers set for nomination endpoint:', {
+      origin,
+      allowedOrigin: origin || '*',
+      isGulfNewsDomain
+    });
+    
+    if (req.method === 'OPTIONS') {
+      res.sendStatus(200);
+      return;
+    }
+  } else {
+    console.log('CORS request rejected for nomination endpoint:', {
+      origin,
+      allowedOrigins: FRONTEND_URLS
+    });
+  }
+  
+  next();
+});
+
+// Additional CORS middleware specifically for new nominations endpoints
+app.use('/api/nominations', (req, res, next) => {
+  const origin = req.headers.origin;
+  console.log('Nominations endpoint CORS check - Origin:', origin);
+  console.log('Nominations endpoint CORS check - Allowed origins:', FRONTEND_URLS);
+  
+  // Always allow gulfnews-events.com domains
+  const isGulfNewsDomain = origin && (
+    origin.includes('gulfnews-events.com') || 
+    origin.includes('www.gulfnews-events.com')
+  );
+  
+  if (!origin || FRONTEND_URLS.includes(origin) || isGulfNewsDomain) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Max-Age', '86400');
+    
+    console.log('CORS headers set for nominations endpoint:', {
+      origin,
+      allowedOrigin: origin || '*',
+      isGulfNewsDomain
+    });
+    
+    if (req.method === 'OPTIONS') {
+      res.sendStatus(200);
+      return;
+    }
+  } else {
+    console.log('CORS request rejected for nominations endpoint:', {
+      origin,
+      allowedOrigins: FRONTEND_URLS
+    });
+  }
+  
+  next();
+});
+
+// Handle preflight requests for all endpoints
+app.options('*', (req, res) => {
+  const origin = req.headers.origin;
+  console.log('Preflight request from origin:', origin);
+  
+  const isGulfNewsDomain = origin && (
+    origin.includes('gulfnews-events.com') || 
+    origin.includes('www.gulfnews-events.com')
+  );
+
+  if (!origin || FRONTEND_URLS.includes(origin) || isGulfNewsDomain) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Accept, Content-Type, Authorization, X-Requested-With');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Max-Age', '86400'); // 24 hours
+    res.header('Vary', 'Origin');
+  }
+  
+  res.sendStatus(204);
+});
 
 // Health check
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'OK', message: 'Gulf News API is running' });
+});
+
+// CORS test endpoint
+app.get('/api/cors-test', (_req, res) => {
+  console.log('CORS Test - Origin:', _req.headers.origin);
+  res.json({ 
+    status: 'OK', 
+    message: 'CORS is working',
+    origin: _req.headers.origin,
+    allowedOrigins: FRONTEND_URLS,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Debug endpoint to check CORS configuration
+app.get('/api/debug/cors', (_req, res) => {
+  res.json({
+    status: 'OK',
+    message: 'CORS Debug Information',
+    requestOrigin: _req.headers.origin,
+    allowedOrigins: FRONTEND_URLS,
+    isOriginAllowed: !_req.headers.origin || FRONTEND_URLS.includes(_req.headers.origin),
+    environment: {
+      FRONTEND_URL: process.env.FRONTEND_URL,
+      FRONTEND_URLS: process.env.FRONTEND_URLS,
+      NODE_ENV: process.env.NODE_ENV
+    },
+    timestamp: new Date().toISOString()
+  });
 });
 
 // ==================== CYBERSOURCE CHARGE ====================
@@ -460,6 +641,320 @@ app.get('/api/payments/cybersource/config-check', async (req, res) => {
   }
 });
 
+// ==================== CYBERSOURCE HOSTED CHECKOUT ====================
+
+// Add specific CORS headers for CyberSource endpoints
+app.use('/api/payments/cybersource-hosted', (req, res, next) => {
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(200);
+    return;
+  }
+  next();
+});
+
+// Create payment parameters for CyberSource Hosted Checkout (API endpoint)
+app.post('/api/payments/cybersource-hosted/create-payment-params', async (req, res) => {
+  try {
+    console.log('=== CyberSource Payment Params Request ===');
+    console.log('Origin:', req.headers.origin);
+    console.log('Headers:', req.headers);
+    console.log('Body:', req.body);
+    
+    const { 
+      amount, 
+      currency = 'AED', 
+      customerEmail, 
+      customerFirstName, 
+      customerLastName, 
+      customerAddress, 
+      customerCity, 
+      customerCountry, 
+      nominationData 
+    } = req.body;
+
+    console.log('Creating payment parameters for Hosted Checkout');
+    console.log('Request data:', req.body);
+
+    // Validate required fields
+    if (!amount || !customerEmail) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'amount and customerEmail are required' 
+      });
+    }
+
+    // Validate CyberSource configuration
+    const configValidation = validateCyberSourceConfig();
+    if (!configValidation.isValid) {
+      return res.status(500).json({
+        success: false,
+        error: 'CyberSource configuration incomplete',
+        missingVariables: configValidation.missingVars
+      });
+    }
+
+    // Create payment request
+    const paymentRequest = {
+      customerEmail,
+      customerFirstName,
+      customerLastName,
+      customerAddress,
+      customerCity,
+      customerCountry,
+      amount: parseFloat(amount),
+      currency,
+      nominationData
+    };
+
+    // Generate CyberSource payment parameters
+    const paymentParams = createPaymentParams(paymentRequest);
+
+    console.log('Payment parameters created successfully:', {
+      amount,
+      currency,
+      customerEmail,
+      referenceNumber: paymentParams.reference_number
+    });
+
+    // Return the payment parameters for frontend to use
+    return res.json({
+      success: true,
+      paymentParams,
+      cybersourceUrl: getCyberSourceUrl(),
+      message: 'Payment parameters created successfully'
+    });
+
+  } catch (error) {
+    console.error('CyberSource payment parameters creation error:', error);
+    return res.status(500).json({ 
+      success: false,
+      error: 'Failed to create payment parameters',
+      details: error.message 
+    });
+  }
+});
+
+// Create nomination payment request with CyberSource Hosted Checkout
+app.post('/api/payments/cybersource/nomination-payment', async (req, res) => {
+  try {
+    const { 
+      amount, 
+      currency = 'AED', 
+      customerEmail, 
+      customerFirstName, 
+      customerLastName, 
+      customerAddress, 
+      customerCity, 
+      customerCountry, 
+      nominationData 
+    } = req.body;
+
+    // Validate required fields
+    if (!amount || !customerEmail) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'amount and customerEmail are required' 
+      });
+    }
+
+    // Validate CyberSource configuration
+    const configValidation = validateCyberSourceConfig();
+    if (!configValidation.isValid) {
+      return res.status(500).json({
+        success: false,
+        error: 'CyberSource configuration incomplete',
+        missingVariables: configValidation.missingVars
+      });
+    }
+
+    // Create payment request
+    const paymentRequest = {
+      customerEmail,
+      customerFirstName,
+      customerLastName,
+      customerAddress,
+      customerCity,
+      customerCountry,
+      amount: parseFloat(amount),
+      currency,
+      nominationData
+    };
+
+    // Generate CyberSource payment parameters
+    const paymentParams = createPaymentParams(paymentRequest);
+
+    // Store nomination data temporarily (you might want to use Redis or database)
+    // For now, we'll include it in the reference number for tracking
+    console.log('Creating nomination payment request:', {
+      amount,
+      currency,
+      customerEmail,
+      referenceNumber: paymentParams.reference_number
+    });
+
+    // Return the HTML form for CyberSource redirect
+    const htmlForm = createCyberSourceForm(paymentParams);
+    
+    res.setHeader('Content-Type', 'text/html');
+    res.send(htmlForm);
+
+  } catch (error) {
+    console.error('CyberSource nomination payment error:', error);
+    return res.status(500).json({ 
+      success: false,
+      error: 'Failed to create payment request',
+      details: error.message 
+    });
+  }
+});
+
+// Handle CyberSource return URL (payment result)
+app.post('/api/payments/cybersource/return', async (req, res) => {
+  try {
+    console.log('CyberSource return received:', req.body);
+
+    // Process the payment response
+    const paymentResult = processPaymentResponse(req.body);
+
+    console.log('Payment result:', {
+      transactionId: paymentResult.transactionId,
+      decision: paymentResult.decision,
+      isSuccess: paymentResult.isSuccess,
+      amount: paymentResult.amount
+    });
+
+    if (paymentResult.isSuccess) {
+      // Payment was successful - save transaction and nomination to database
+      const client = await clientPromise;
+      const db = client.db('eventTicketingDB');
+      
+      // Create transaction record
+      const transaction = {
+        transactionId: paymentResult.transactionId,
+        paymentMethod: 'cybersource_hosted',
+        amount: parseFloat(paymentResult.amount),
+        currency: paymentResult.currency,
+        status: 'completed',
+        customerEmail: paymentResult.billToEmail,
+        authCode: paymentResult.authCode,
+        authTime: paymentResult.authTime,
+        cardType: paymentResult.cardType,
+        decision: paymentResult.decision,
+        reasonCode: paymentResult.reasonCode,
+        processorResponse: paymentResult.processorResponse,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      // Save transaction to transactions collection
+      const transactionResult = await db.collection('transactions').insertOne(transaction);
+      console.log('Transaction saved successfully:', transactionResult.insertedId);
+
+      // Create nomination record (without transaction details)
+      const nomination = {
+        customerEmail: paymentResult.billToEmail,
+        customerFirstName: paymentResult.billToForename,
+        customerLastName: paymentResult.billToSurname,
+        transactionId: paymentResult.transactionId,
+        submittedAt: new Date(),
+        status: 'submitted',
+        // Add any additional nomination data here
+        nominationData: {} // You might want to store this separately
+      };
+
+      await db.collection('nominations').insertOne(nomination);
+
+      // Send nomination confirmation email
+      if (nomination.customerEmail) {
+        console.log('Sending nomination confirmation email to:', nomination.customerEmail);
+        await sendNominationConfirmationEmail(nomination.customerEmail, nomination);
+      }
+
+      // Redirect to success page
+      const frontendUrl = getFrontendBase();
+      return res.redirect(`${frontendUrl}/nomination/success?transaction_id=${paymentResult.transactionId}`);
+    } else {
+      // Payment failed - redirect to error page
+      const frontendUrl = getFrontendBase();
+      return res.redirect(`${frontendUrl}/nomination/error?reason=${paymentResult.reasonCode}&message=${encodeURIComponent(paymentResult.message)}`);
+    }
+
+  } catch (error) {
+    console.error('CyberSource return processing error:', error);
+    
+    // Redirect to error page
+    const frontendUrl = getFrontendBase();
+    return res.redirect(`${frontendUrl}/nomination/error?reason=PROCESSING_ERROR&message=${encodeURIComponent('Payment processing failed')}`);
+  }
+});
+
+// Handle CyberSource cancel URL (user cancelled payment)
+app.post('/api/payments/cybersource/cancel', async (req, res) => {
+  try {
+    console.log('CyberSource payment cancelled:', req.body);
+    
+    // Redirect to cancel page
+    const frontendUrl = getFrontendBase();
+    return res.redirect(`${frontendUrl}/nomination/cancelled`);
+    
+  } catch (error) {
+    console.error('CyberSource cancel processing error:', error);
+    
+    const frontendUrl = getFrontendBase();
+    return res.redirect(`${frontendUrl}/nomination/cancelled`);
+  }
+});
+
+// Test CyberSource Hosted Checkout configuration
+app.get('/api/payments/cybersource/hosted-config-check', async (req, res) => {
+  try {
+    const configValidation = validateCyberSourceConfig();
+    
+    const configStatus = {
+      accessKey: {
+        set: !!process.env.CYBERSOURCE_ACCESS_KEY,
+        value: process.env.CYBERSOURCE_ACCESS_KEY ? `${process.env.CYBERSOURCE_ACCESS_KEY.substring(0, 8)}...` : 'NOT_SET'
+      },
+      profileId: {
+        set: !!process.env.CYBERSOURCE_PROFILE_ID,
+        value: process.env.CYBERSOURCE_PROFILE_ID ? `${process.env.CYBERSOURCE_PROFILE_ID.substring(0, 8)}...` : 'NOT_SET'
+      },
+      secretKey: {
+        set: !!process.env.CYBERSOURCE_SECRET_KEY,
+        value: process.env.CYBERSOURCE_SECRET_KEY ? 'SET' : 'NOT_SET'
+      },
+      environment: {
+        value: process.env.CYBERSOURCE_ENVIRONMENT || 'NOT_SET',
+        url: process.env.CYBERSOURCE_ENVIRONMENT === 'production' 
+          ? 'https://secureacceptance.cybersource.com/pay'
+          : 'https://testsecureacceptance.cybersource.com/pay'
+      }
+    };
+
+    return res.json({
+      success: true,
+      configured: configValidation.isValid,
+      config: configStatus,
+      missingVariables: configValidation.missingVars,
+      message: configValidation.isValid 
+        ? 'CyberSource Hosted Checkout configuration is complete' 
+        : 'CyberSource Hosted Checkout configuration is incomplete'
+    });
+
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to check CyberSource Hosted Checkout configuration',
+      details: error.message
+    });
+  }
+});
+
 // ==================== PDF S3 UPLOAD ====================
 app.post('/api/upload', upload, async (req, res) => {
   console.log("=== PDF UPLOAD REQUEST RECEIVED ===");
@@ -572,6 +1067,263 @@ app.delete('/api/delete/:fileKey', async (req, res) => {
       success: false,
       error: 'Failed to delete file', 
       details: error.message 
+    });
+  }
+});
+
+// ==================== TRANSACTION VERIFICATION ====================
+
+// Get transaction details by ObjectId for verification
+app.get('/api/nominations/:id/transaction/:transactionId', async (req, res) => {
+  try {
+    const { id: nominationId } = req.params;
+    const { transactionId } = req.params;
+    
+    // Validate ObjectId format
+    if (!ObjectId.isValid(nominationId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid nomination ID',
+        message: 'Nomination ID must be a valid MongoDB ObjectId'
+      });
+    }
+
+    // Connect to MongoDB
+    const client = await clientPromise;
+    const db = client.db('eventTicketingDB');
+    
+    // Find nomination by ObjectId
+    const nomination = await db.collection('nominations').findOne({ _id: new ObjectId(nominationId) });
+    const transactionInfo = await db.collection('transactions').findOne({ transactionId: transactionId });
+
+    if (!nomination) {
+      return res.status(404).json({
+        success: false,
+        error: 'Nomination not found',
+        message: 'No nomination found with the provided ID'
+      });
+    }
+
+    // Update nomination status if email matches and transaction exists
+    const nominationEmail = nomination.email || nomination.customerEmail;
+    const transactionEmail = transactionInfo?.customerEmail || transactionInfo?.email;
+    
+    if (transactionInfo && nominationEmail && transactionEmail && 
+        nominationEmail.toLowerCase() === transactionEmail.toLowerCase()) {
+      console.log('Email match found - updating nomination status to paid');
+      
+      // Update the nomination status in the database
+      await db.collection('nominations').updateOne(
+        { _id: new ObjectId(nominationId) },
+        { 
+          $set: { 
+            status: 'paid',
+            transactionId: transactionInfo.transactionId || transactionInfo._id.toString(),
+            paidAt: new Date()
+          } 
+        }
+      );
+      
+      nomination.status = 'paid';
+      nomination.transactionId = transactionInfo.transactionId || transactionInfo._id.toString();
+      console.log('Nomination status updated successfully');
+    } else {
+      console.log('Email mismatch or missing data:', {
+        nominationEmail,
+        transactionEmail,
+        hasTransactionInfo: !!transactionInfo
+      });
+    }
+
+    // Return transaction details for verification
+    const transactionDetails = {
+      _id: nomination._id,
+      customerEmail: nomination.email || nomination.customerEmail,
+      customerFirstName: nomination.firstName || nomination.customerFirstName,
+      customerLastName: nomination.lastName || nomination.customerLastName,
+      transactionId: nomination.transactionId,
+      submittedAt: nomination.submittedAt,
+      status: nomination.status,
+      statusUpdated: nomination.status === 'paid' // Indicates if status was just updated
+    };
+
+    // Get transaction details from transactions collection
+    const transaction = await db.collection('transactions').findOne({ 
+      transactionId: nomination.transactionId 
+    });
+
+    if (transaction) {
+      transactionDetails.paymentAmount = transaction.amount;
+      transactionDetails.paymentCurrency = transaction.currency;
+      transactionDetails.paymentMethod = transaction.paymentMethod;
+      transactionDetails.paymentStatus = transaction.status;
+      transactionDetails.paidAt = transaction.createdAt;
+      
+      // Add CyberSource specific fields if available
+      if (transaction.authCode) transactionDetails.authCode = transaction.authCode;
+      if (transaction.authTime) transactionDetails.authTime = transaction.authTime;
+      if (transaction.cardType) transactionDetails.cardType = transaction.cardType;
+      if (transaction.decision) transactionDetails.decision = transaction.decision;
+    }
+
+    res.json({
+      success: true,
+      transaction: transactionDetails,
+      message: nomination.status === 'paid' ? 'Nomination status updated to paid' : 'Nomination status unchanged'
+    });
+
+  } catch (error) {
+    console.error('Get transaction error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get transaction details',
+      details: error.message
+    });
+  }
+});
+
+// Update payment status from unpaid to paid (with transaction verification)
+app.patch('/api/nominations/:id/payment-status', async (req, res) => {
+  try {
+    const { id: nominationId } = req.params;
+    const { transactionId, email } = req.body;
+    
+    // Validate ObjectId format
+    if (!ObjectId.isValid(nominationId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid nomination ID',
+        message: 'Nomination ID must be a valid MongoDB ObjectId'
+      });
+    }
+
+    // Validate required fields
+    if (!transactionId || !email) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields',
+        message: 'transactionId and email are required for verification'
+      });
+    }
+
+    // Connect to MongoDB
+    const client = await clientPromise;
+    const db = client.db('eventTicketingDB');
+    
+    // Find nomination by ObjectId
+    const nomination = await db.collection('nominations').findOne({ _id: new ObjectId(nominationId) });
+    
+    if (!nomination) {
+      return res.status(404).json({
+        success: false,
+        error: 'Nomination not found',
+        message: 'No nomination found with the provided ID'
+      });
+    }
+
+    // Verify transaction details match
+    const emailMatch = (nomination.email || nomination.customerEmail) === email;
+    const transactionMatch = nomination.transactionId === transactionId;
+    
+    if (!emailMatch || !transactionMatch) {
+      return res.status(400).json({
+        success: false,
+        error: 'Transaction verification failed',
+        message: 'Email or transaction ID does not match the nomination record',
+        details: {
+          emailMatch,
+          transactionMatch,
+          providedEmail: email,
+          providedTransactionId: transactionId,
+          storedEmail: nomination.email || nomination.customerEmail,
+          storedTransactionId: nomination.transactionId
+        }
+      });
+    }
+
+    // Verify transaction exists and is completed
+    const transaction = await db.collection('transactions').findOne({ 
+      transactionId: transactionId 
+    });
+
+    if (!transaction) {
+      return res.status(404).json({
+        success: false,
+        error: 'Transaction not found',
+        message: 'No transaction found with the provided transaction ID'
+      });
+    }
+
+    if (transaction.status !== 'completed') {
+      return res.status(400).json({
+        success: false,
+        error: 'Transaction not completed',
+        message: 'Transaction status is not completed'
+      });
+    }
+
+    // Check if nomination is already paid
+    if (nomination.status === 'paid') {
+      return res.status(400).json({
+        success: false,
+        error: 'Nomination already paid',
+        message: 'This nomination has already been marked as paid',
+        paidAt: nomination.paidAt
+      });
+    }
+
+    // Update nomination status to paid
+    const updateData = {
+      status: 'paid',
+      paymentStatus: 'completed',
+      paidAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const result = await db.collection('nominations').updateOne(
+      { _id: new ObjectId(nominationId) },
+      { $set: updateData }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Nomination not found',
+        message: 'No nomination found with the provided ID'
+      });
+    }
+
+    if (result.modifiedCount === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No changes made',
+        message: 'Nomination status was not updated'
+      });
+    }
+
+    // Get updated nomination for response
+    const updatedNomination = await db.collection('nominations').findOne({ _id: new ObjectId(nominationId) });
+
+    res.json({
+      success: true,
+      message: 'Payment status updated successfully',
+      nomination: {
+        _id: updatedNomination._id,
+        status: updatedNomination.status,
+        paymentStatus: updatedNomination.paymentStatus,
+        paidAt: updatedNomination.paidAt,
+        customerEmail: updatedNomination.email || updatedNomination.customerEmail,
+        paymentAmount: updatedNomination.paymentAmount,
+        paymentCurrency: updatedNomination.paymentCurrency
+      }
+    });
+
+  } catch (error) {
+    console.error('Update payment status error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update payment status',
+      details: error.message
     });
   }
 });
@@ -758,8 +1510,26 @@ app.post('/api/register-attendee', async (req, res) => {
     const body = req.body;
     const { firstName, lastName, email, phone, company, position, industry, interests, dietaryRequirements } = body;
 
-    // Save registration to database (optional)
-    // You can add MongoDB integration here if needed
+    // Save registration to database
+    const client = await clientPromise;
+    const db = client.db('eventTicketingDB');
+    
+    const attendeeData = {
+      firstName,
+      lastName,
+      email,
+      phone,
+      company,
+      position,
+      industry,
+      interests,
+      dietaryRequirements,
+      submittedAt: new Date(),
+      status: 'registered'
+    };
+    
+    const result = await db.collection('attendee_registrations').insertOne(attendeeData);
+    console.log('Attendee registration saved successfully:', result.insertedId);
 
     // Send confirmation email to attendee
     await sendRegistrationConfirmationEmail(email, body);
@@ -778,9 +1548,9 @@ app.post('/api/register-attendee', async (req, res) => {
 });
 
 async function sendRegistrationConfirmationEmail(email, data) {
-  const eventName = process.env.NEXT_PUBLIC_EVENT_NAME || 'Annual Tech Conference 2025';
-  const eventDate = process.env.NEXT_PUBLIC_EVENT_DATE || 'December 15, 2025';
-  const eventLocation = process.env.NEXT_PUBLIC_EVENT_LOCATION || 'Grand Convention Center, Dubai';
+  const eventName = process.env.NEXT_PUBLIC_EVENT_NAME || 'The Sustainability Excellence Awards 2025';
+  const eventDate = process.env.NEXT_PUBLIC_EVENT_DATE || '';
+  const eventLocation = process.env.NEXT_PUBLIC_EVENT_LOCATION || '';
 
   const emailHtml = `
 <!DOCTYPE html>
@@ -799,39 +1569,32 @@ async function sendRegistrationConfirmationEmail(email, data) {
           <!-- Header -->
           <tr>
             <td style="background: linear-gradient(135deg, #224442 0%, #DBE2CD 100%); padding: 40px 40px 30px; text-align: center;">
-              <h1 style="margin: 0; color: #FFFFFF; font-size: 32px; font-weight: bold;">🎉 Registration Confirmed!</h1>
-              <p style="margin: 10px 0 0; color: #FFFFFF; font-size: 16px;">You're all set for the event</p>
+              <h1 style="margin: 0; color: #FFFFFF; font-size: 32px; font-weight: bold;">Registration Received</h1>
+              <p style="margin: 10px 0 0; color: #FFFFFF; font-size: 16px;">${eventName}</p>
             </td>
           </tr>
 
           <!-- Welcome Message -->
           <tr>
             <td style="padding: 40px; text-align: center;">
-              <h2 style="margin: 0 0 20px; color: #224442; font-size: 24px;">
-                Hello, ${data.firstName} ${data.lastName}!
-              </h2>
-              <p style="margin: 0 0 30px; color: #000000; font-size: 16px; line-height: 1.6;">
-                Thank you for registering! We're excited to have you join us for ${eventName}.
-              </p>
+              <h2 style="margin: 0 0 20px; color: #224442; font-size: 24px;">Hi ${data.firstName},</h2>
+              <p style="margin: 0 0 15px; color: #000000; font-size: 16px; line-height: 1.6;">Thank you for registering to attend ${eventName}.</p>
+              <p style="margin: 0 0 15px; color: #000000; font-size: 16px; line-height: 1.6;">We’ve received your registration details. As seats are limited, our team will review and verify your information before confirming your attendance. You’ll receive a follow-up email once your registration is approved.</p>
+              <p style="margin: 0; color: #000000; font-size: 16px; line-height: 1.6;">We appreciate your interest in joining this landmark event celebrating sustainability innovation and leadership across the region.</p>
             </td>
           </tr>
 
-          <!-- Event Details -->
+          <!-- Event Details (optional) -->
+          ${eventDate || eventLocation ? `
           <tr>
             <td style="padding: 0 40px 30px;">
               <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #E7FB7A; border-radius: 12px; padding: 30px;">
                 <tr>
                   <td>
-                    <h3 style="margin: 0 0 20px; color: #224442; font-size: 20px; font-weight: bold;">${eventName}</h3>
+                    <h3 style="margin: 0 0 20px; color: #224442; font-size: 20px; font-weight: bold;">Event Details</h3>
                     <table width="100%" cellpadding="8" cellspacing="0">
-                      <tr>
-                        <td style="color: #000000; font-size: 14px; width: 100px;">📅 Date:</td>
-                        <td style="color: #224442; font-size: 14px; font-weight: 600;">${eventDate}</td>
-                      </tr>
-                      <tr>
-                        <td style="color: #000000; font-size: 14px;">📍 Location:</td>
-                        <td style="color: #224442; font-size: 14px; font-weight: 600;">${eventLocation}</td>
-                      </tr>
+                      ${eventDate ? `<tr><td style="color: #000000; font-size: 14px; width: 100px;">📅 Date:</td><td style=\"color: #224442; font-size: 14px; font-weight: 600;\">${eventDate}</td></tr>` : ''}
+                      ${eventLocation ? `<tr><td style="color: #000000; font-size: 14px;">📍 Location:</td><td style=\"color: #224442; font-size: 14px; font-weight: 600;\">${eventLocation}</td></tr>` : ''}
                       <tr>
                         <td style="color: #000000; font-size: 14px;">👤 Attendee:</td>
                         <td style="color: #224442; font-size: 14px; font-weight: 600;">${data.firstName} ${data.lastName}</td>
@@ -842,6 +1605,7 @@ async function sendRegistrationConfirmationEmail(email, data) {
               </table>
             </td>
           </tr>
+          ` : ''}
 
           ${data.interests && data.interests.length > 0 ? `
           <!-- Interests -->
@@ -891,12 +1655,10 @@ async function sendRegistrationConfirmationEmail(email, data) {
           <tr>
             <td style="padding: 0 40px 30px;">
               <div style="background-color: #E7FB7A; border-left: 4px solid #224442; border-radius: 8px; padding: 20px;">
-                <h4 style="margin: 0 0 10px; color: #224442; font-size: 16px;">📋 Important Information</h4>
+                <h4 style="margin: 0 0 10px; color: #224442; font-size: 16px;">📋 Next Steps</h4>
                 <ul style="margin: 0; padding-left: 20px; color: #000000; font-size: 14px; line-height: 1.8;">
-                  <li>Please arrive 30 minutes early for check-in</li>
-                  <li>Bring a valid photo ID for verification</li>
-                  <li>Dress code: Business casual</li>
-                  <li>WiFi and charging stations will be available</li>
+                  <li>Our team will review your registration due to limited seating</li>
+                  <li>You will receive a confirmation email once approved</li>
                   ${data.dietaryRequirements ? `<li>We've noted your dietary requirements: ${data.dietaryRequirements}</li>` : ''}
                 </ul>
               </div>
@@ -925,7 +1687,7 @@ async function sendRegistrationConfirmationEmail(email, data) {
           <!-- Footer -->
           <tr>
             <td style="background-color: #DBE2CD; padding: 30px 40px; text-align: center; border-top: 1px solid #00000040;">
-              <p style="margin: 0 0 10px; color: #224442; font-size: 18px; font-weight: 600;">We're looking forward to seeing you! 🎊</p>
+              <p style="margin: 0 0 10px; color: #224442; font-size: 18px; font-weight: 600;">Best regards,<br/>The Sustainability Excellence Awards 2025 Team<br/>Gulf News & BeingShe</p>
               <p style="margin: 0; color: #000000; font-size: 12px;">
                 © ${new Date().getFullYear()} Event Registration. All rights reserved.
               </p>
@@ -942,7 +1704,7 @@ async function sendRegistrationConfirmationEmail(email, data) {
 
   await sendEmail({
     to: email,
-    subject: `🎉 Registration Confirmed - ${eventName}`,
+    subject: `Registration Received – ${eventName}`,
     html: emailHtml,
   });
 }
@@ -1034,6 +1796,50 @@ async function sendRegistrationNotificationEmail(data) {
   });
 }
 
+// Dedicated CORS middleware for sponsorship endpoint
+app.use('/api/sponsorship', (req, res, next) => {
+  const origin = req.headers.origin;
+  const isGulfNewsDomain = origin && (
+    origin.includes('gulfnews-events.com') ||
+    origin.includes('www.gulfnews-events.com')
+  );
+
+  if (!origin || FRONTEND_URLS.includes(origin) || isGulfNewsDomain) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+    res.header('Access-Control-Allow-Headers', 'Accept, Content-Type, Authorization, X-Requested-With');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Max-Age', '86400');
+    res.header('Vary', 'Origin');
+
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+  }
+
+  return next();
+});
+
+// Explicit OPTIONS handler for sponsorship
+app.options('/api/sponsorship', (req, res) => {
+  const origin = req.headers.origin;
+  const isGulfNewsDomain = origin && (
+    origin.includes('gulfnews-events.com') ||
+    origin.includes('www.gulfnews-events.com')
+  );
+
+  if (!origin || FRONTEND_URLS.includes(origin) || isGulfNewsDomain) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+    res.header('Access-Control-Allow-Headers', 'Accept, Content-Type, Authorization, X-Requested-With');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Max-Age', '86400');
+    res.header('Vary', 'Origin');
+  }
+
+  return res.sendStatus(204);
+});
+
 // ==================== SPONSORSHIP ====================
 app.post('/api/sponsorship', async (req, res) => {
   try {
@@ -1070,8 +1876,12 @@ app.post('/api/sponsorship', async (req, res) => {
       status: 'submitted'
     };
 
-    // Save sponsorship request to database (optional)
-    // You can add MongoDB integration here if needed
+    // Save sponsorship request to database
+    const client = await clientPromise;
+    const db = client.db('eventTicketingDB');
+    
+    const result = await db.collection('sponsorship_requests').insertOne(sponsorshipData);
+    console.log('Sponsorship request saved successfully:', result.insertedId);
 
     // Send confirmation email to sponsor
     await sendSponsorshipConfirmationEmail(email, sponsorshipData);
@@ -1089,7 +1899,331 @@ app.post('/api/sponsorship', async (req, res) => {
   }
 });
 
-// ==================== NOMINATION ====================
+// ==================== NOMINATION FORM FLOW ====================
+
+// Create Nomination (Initial Submission with 'unpaid' status)
+app.post('/api/nominations', async (req, res) => {
+  try {
+    const body = req.body;
+    console.log('Received nomination form data:', body);
+
+    // Extract nomination data from the payload
+    const {
+      firstName,
+      lastName,
+      email,
+      companyName,
+      designation,
+      phone,
+      category,
+      tradeLicense,
+      supportingDocument,
+      message,
+      status = 'unpaid',
+      submittedAt
+    } = body;
+
+    // Validate required fields
+    const requiredFields = ['firstName', 'lastName', 'email', 'companyName', 'designation', 'phone'];
+    const missingFields = requiredFields.filter(field => !body[field]);
+    
+    if (missingFields.length > 0) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Missing required fields',
+        missingFields: missingFields,
+        message: `The following fields are required: ${missingFields.join(', ')}`
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid email format',
+        message: 'Please provide a valid email address'
+      });
+    }
+
+    // Validate phone format (UAE phone number)
+    const phoneRegex = /^\+971[0-9]{9}$/;
+    if (!phoneRegex.test(phone)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid phone format',
+        message: 'Please provide a valid UAE phone number (+971XXXXXXXXX)'
+      });
+    }
+
+    // Validate tradeLicense (if provided) - max 1 file
+    if (tradeLicense) {
+      const tradeLicenseUrls = tradeLicense.split(',').filter(url => url.trim());
+      
+      if (tradeLicenseUrls.length > 1) {
+        return res.status(400).json({ 
+          success: false,
+          error: 'Only one trade license file is allowed',
+          message: 'You can only upload one trade license file'
+        });
+      }
+
+      // Validate URL format
+      if (tradeLicenseUrls.length > 0) {
+        const urlRegex = /^https?:\/\/.+/i;
+        const url = tradeLicenseUrls[0];
+        
+        if (!urlRegex.test(url)) {
+          return res.status(400).json({ 
+            success: false,
+            error: 'Invalid trade license URL format',
+            message: 'Trade license must be a valid URL starting with http:// or https://'
+          });
+        }
+      }
+    }
+
+    // Validate supportingDocument (if provided) - max 3 files
+    if (supportingDocument) {
+      const supportingUrls = supportingDocument.split(',').filter(url => url.trim());
+      
+      if (supportingUrls.length > 3) {
+        return res.status(400).json({ 
+          success: false,
+          error: 'Maximum 3 supporting documents allowed',
+          message: 'You can only upload a maximum of 3 supporting documents'
+        });
+      }
+
+      // Validate URL format for each supporting document
+      for (const url of supportingUrls) {
+        const urlRegex = /^https?:\/\/.+/i;
+        if (!urlRegex.test(url)) {
+          return res.status(400).json({ 
+            success: false,
+            error: 'Invalid supporting document URL format',
+            message: 'All supporting document URLs must be valid URLs starting with http:// or https://'
+          });
+        }
+      }
+    }
+
+    // Validate status
+    if (status && !['unpaid', 'paid'].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid status',
+        message: 'Status must be either "unpaid" or "paid"'
+      });
+    }
+
+    // Connect to MongoDB
+    const client = await clientPromise;
+    const db = client.db('eventTicketingDB');
+    
+    // Create nomination document with initial 'unpaid' status
+    const nomination = {
+      firstName,
+      lastName,
+      email,
+      companyName,
+      designation,
+      phone,
+      category: category || null,
+      tradeLicense: tradeLicense || null,
+      supportingDocument: supportingDocument || null,
+      message: message || null,
+      
+      // Status tracking
+      status: status,
+      submittedAt: submittedAt ? new Date(submittedAt) : new Date(),
+      paidAt: null,
+      
+      // Payment information (initially null)
+      paymentAmount: null,
+      paymentCurrency: null,
+      paymentDate: null,
+      paymentReference: null,
+      paymentStatus: null,
+      paymentMethod: null,
+      cybersourceTransactionId: null,
+      authCode: null,
+      authTime: null,
+      cardType: null,
+      
+      // Timestamps
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    // Save nomination to database
+    const result = await db.collection('nominations').insertOne(nomination);
+    
+    console.log('Nomination created successfully:', result.insertedId);
+
+    return res.json({
+      success: true,
+      _id: result.insertedId,
+      message: 'Nomination created successfully'
+    });
+
+  } catch (error) {
+    console.error('Error creating nomination:', error);
+    return res.status(500).json({ 
+      success: false,
+      error: 'Failed to create nomination',
+      details: error.message 
+    });
+  }
+});
+
+// Update Nomination Payment Status
+app.patch('/api/nominations/:nominationId/payment', async (req, res) => {
+  try {
+    const { nominationId } = req.params;
+    const body = req.body;
+    
+    console.log('Received payment update for nomination:', nominationId);
+    console.log('Payment data:', body);
+
+    // Validate nominationId format (MongoDB ObjectId)
+    if (!nominationId || nominationId.length !== 24) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid nomination ID',
+        message: 'Nomination ID must be a valid MongoDB ObjectId'
+      });
+    }
+
+    // Extract payment data from the payload
+    const {
+      status,
+      paymentAmount,
+      paymentCurrency,
+      paymentDate,
+      paymentReference,
+      paymentStatus,
+      paymentMethod,
+      cybersourceTransactionId,
+      authCode,
+      authTime,
+      cardType,
+      paidAt
+    } = body;
+
+    // Validate required payment fields
+    const requiredPaymentFields = ['status', 'paymentAmount', 'paymentCurrency', 'paymentDate', 'paymentReference', 'paymentStatus', 'paymentMethod'];
+    const missingPaymentFields = requiredPaymentFields.filter(field => body[field] === undefined || body[field] === null);
+    
+    if (missingPaymentFields.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required payment fields',
+        missingFields: missingPaymentFields,
+        message: `The following payment fields are required: ${missingPaymentFields.join(', ')}`
+      });
+    }
+
+    // Validate status
+    if (status !== 'paid') {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid status',
+        message: 'Status must be "paid" for payment updates'
+      });
+    }
+
+    // Validate payment amount
+    if (isNaN(paymentAmount) || paymentAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid payment amount',
+        message: 'Payment amount must be a positive number'
+      });
+    }
+
+    // Connect to MongoDB
+    const client = await clientPromise;
+    const db = client.db('eventTicketingDB');
+    
+    // Check if nomination exists
+    const existingNomination = await db.collection('nominations').findOne({ _id: new ObjectId(nominationId) });
+    
+    if (!existingNomination) {
+      return res.status(404).json({
+        success: false,
+        error: 'Nomination not found',
+        message: 'No nomination found with the provided ID'
+      });
+    }
+
+    // Check if nomination is already paid
+    if (existingNomination.status === 'paid') {
+      return res.status(400).json({
+        success: false,
+        error: 'Nomination already paid',
+        message: 'This nomination has already been marked as paid'
+      });
+    }
+
+    // Update nomination with payment information
+    const updateData = {
+      status: status,
+      paymentAmount: parseFloat(paymentAmount),
+      paymentCurrency: paymentCurrency,
+      paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
+      paymentReference: paymentReference,
+      paymentStatus: paymentStatus,
+      paymentMethod: paymentMethod,
+      cybersourceTransactionId: cybersourceTransactionId || null,
+      authCode: authCode || null,
+      authTime: authTime ? new Date(authTime) : null,
+      cardType: cardType || null,
+      paidAt: paidAt ? new Date(paidAt) : new Date(),
+      updatedAt: new Date()
+    };
+
+    const result = await db.collection('nominations').updateOne(
+      { _id: new ObjectId(nominationId) },
+      { $set: updateData }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Nomination not found',
+        message: 'No nomination found with the provided ID'
+      });
+    }
+
+    console.log('Payment status updated successfully for nomination:', nominationId);
+
+    // Send confirmation email if we have email data
+    if (existingNomination.email) {
+      console.log('Sending payment confirmation email to:', existingNomination.email);
+      
+      // Get updated nomination data for email
+      const updatedNomination = await db.collection('nominations').findOne({ _id: new ObjectId(nominationId) });
+      await sendNominationConfirmationEmail(existingNomination.email, updatedNomination);
+    }
+
+    return res.json({
+      success: true,
+      _id: nominationId,
+      message: 'Payment status updated successfully'
+    });
+
+  } catch (error) {
+    console.error('Error updating nomination payment:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to update payment status',
+      details: error.message
+    });
+  }
+});
+
+// ==================== LEGACY NOMINATION ENDPOINT (for backward compatibility) ====================
 app.post('/api/nomination', async (req, res) => {
   try {
     const body = req.body;
@@ -1106,6 +2240,7 @@ app.post('/api/nomination', async (req, res) => {
       tradeLicense,
       supportingDocument,
       message,
+      category,
       paymentAmount,
       paymentCurrency,
       paymentDate,
@@ -1135,6 +2270,7 @@ app.post('/api/nomination', async (req, res) => {
       tradeLicense,
       supportingDocument,
       message,
+      category,
       paymentAmount: parseFloat(paymentAmount) || 0,
       paymentCurrency: paymentCurrency || 'AED',
       paymentDate: paymentDate ? new Date(paymentDate) : new Date(),
@@ -1191,20 +2327,19 @@ async function sendSponsorshipConfirmationEmail(email, data) {
           <!-- Header -->
           <tr>
             <td style="background: linear-gradient(135deg, #224442 0%, #DBE2CD 100%); padding: 40px 40px 30px; text-align: center;">
-              <h1 style="margin: 0; color: #FFFFFF; font-size: 32px; font-weight: bold;">🤝 Sponsorship Request Received!</h1>
-              <p style="margin: 10px 0 0; color: #FFFFFF; font-size: 16px;">Thank you for your interest in partnering with us</p>
+              <h1 style="margin: 0; color: #FFFFFF; font-size: 24px; font-weight: bold;">Thank You for Your Sponsorship Submission</h1>
+              <p style="margin: 10px 0 0; color: #FFFFFF; font-size: 16px;">The Sustainability Excellence Awards 2025</p>
             </td>
           </tr>
 
           <!-- Welcome Message -->
           <tr>
             <td style="padding: 40px; text-align: center;">
-              <h2 style="margin: 0 0 20px; color: #224442; font-size: 24px;">
-                Hello, ${data.contactPerson}!
-              </h2>
-              <p style="margin: 0 0 30px; color: #000000; font-size: 16px; line-height: 1.6;">
-                Thank you for your sponsorship request. We're excited about the possibility of partnering your company for our upcoming event.
-              </p>
+              <h2 style="margin: 0 0 20px; color: #224442; font-size: 20px;">Hi ${data.contactPerson},</h2>
+              <p style="margin: 0 0 15px; color: #000000; font-size: 16px; line-height: 1.6;">Thank you for your interest in partnering with The Sustainability Excellence Awards 2025.</p>
+              <p style="margin: 0 0 15px; color: #000000; font-size: 16px; line-height: 1.6;">We’ve received your sponsorship submission and our partnerships team will review the details shortly.</p>
+              <p style="margin: 0 0 15px; color: #000000; font-size: 16px; line-height: 1.6;">As a sponsor, you’ll be joining a landmark platform that celebrates innovation, leadership, and sustainability excellence across the region. Our team will be in touch soon to discuss available partnership options and next steps.</p>
+              <p style="margin: 0; color: #000000; font-size: 16px; line-height: 1.6;">We appreciate your support and look forward to collaborating with you on this inaugural event.</p>
             </td>
           </tr>
 
@@ -1243,18 +2378,10 @@ async function sendSponsorshipConfirmationEmail(email, data) {
             </td>
           </tr>
 
-          <!-- Next Steps -->
+          <!-- Signature -->
           <tr>
-            <td style="padding: 0 40px 30px;">
-              <div style="background-color: #E7FB7A; border-left: 4px solid #224442; border-radius: 8px; padding: 20px;">
-                <h4 style="margin: 0 0 10px; color: #224442; font-size: 16px;">📋 What Happens Next?</h4>
-                <ul style="margin: 0; padding-left: 20px; color: #000000; font-size: 14px; line-height: 1.8;">
-                  <li>Our team will review your sponsorship request within 24 hours</li>
-                  <li>We'll contact you to discuss partnership opportunities</li>
-                  <li>We'll provide detailed sponsorship packages and benefits</li>
-                  <li>We'll work together to create a customized sponsorship plan</li>
-                </ul>
-              </div>
+            <td style="padding: 0 40px 30px; text-align: left;">
+              <p style="margin: 0; color: #224442; font-size: 16px; font-weight: 600;">Best regards,<br/>The Sustainability Excellence Awards 2025 Team<br/>Gulf News & BeingShe</p>
             </td>
           </tr>
 
@@ -1297,7 +2424,7 @@ async function sendSponsorshipConfirmationEmail(email, data) {
 
   await sendEmail({
     to: email,
-    subject: '🤝 Sponsorship Request Confirmation - Thank You!',
+    subject: 'Thank You for Your Sponsorship Submission – The Sustainability Excellence Awards 2025',
     html: emailHtml,
   });
 }
@@ -1335,14 +2462,6 @@ async function sendSponsorshipNotificationEmail(data) {
                 <td style="color: #224442; font-size: 14px; font-weight: 600;">Contact Person:</td>
                 <td style="color: #000000; font-size: 14px;">${data.contactPerson}</td>
               </tr>
-              <tr>
-                <td style="color: #224442; font-size: 14px; font-weight: 600;">Company:</td>
-                <td style="color: #000000; font-size: 14px;">${data.companyName}</td>
-              </tr>
-              <tr>
-                <td style="color: #224442; font-size: 14px; font-weight: 600;">Designation:</td>
-                <td style="color: #000000; font-size: 14px;">${data.designation}</td>
-              </tr>
                 <tr>
                   <td style="color: #224442; font-size: 14px; font-weight: 600;">Email:</td>
                   <td style="color: #000000; font-size: 14px;"><a href="mailto:${data.email}" style="color: #224442;">${data.email}</a></td>
@@ -1350,10 +2469,6 @@ async function sendSponsorshipNotificationEmail(data) {
                 <tr>
                   <td style="color: #224442; font-size: 14px; font-weight: 600;">Phone:</td>
                   <td style="color: #000000; font-size: 14px;"><a href="tel:${data.phone}" style="color: #224442;">${data.phone}</a></td>
-                </tr>
-                <tr>
-                  <td style="color: #224442; font-size: 14px; font-weight: 600;">Trade License:</td>
-                  <td style="color: #000000; font-size: 14px;">${data.tradeLicense}</td>
                 </tr>
                 ${data.supportingDocument && data.supportingDocument !== 'Not provided' ? `
                 <tr>
@@ -1434,16 +2549,33 @@ app.get('/api/verify-payment', async (req, res) => {
       console.log('Processing nomination payment for:', nominationData);
       console.log('Nomination data email:', nominationData.email);
 
-      // Save nomination to database
+      // Save transaction and nomination to database
       const client = await clientPromise;
       const db = client.db('eventTicketingDB');
       
+      // Create transaction record
+      const transaction = {
+        transactionId: sessionId,
+        paymentMethod: 'stripe',
+        amount: session.amount_total / 100,
+        currency: session.currency || 'aed',
+        status: 'completed',
+        stripeSessionId: sessionId,
+        stripePaymentIntentId: session.payment_intent,
+        paymentMethodTypes: session.payment_method_types,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      // Save transaction to transactions collection
+      const transactionResult = await db.collection('transactions').insertOne(transaction);
+      console.log('Transaction saved successfully:', transactionResult.insertedId);
+
+      // Create nomination record (without transaction details)
       const nomination = {
         sessionId,
         ...nominationData,
-        paymentAmount: session.amount_total / 100,
-        paymentCurrency: session.currency || 'aed',
-        paymentMethod: session.payment_method_types?.[0] || 'card',
+        transactionId: sessionId,
         submittedAt: new Date().toISOString(),
         status: 'submitted',
       };
@@ -1532,16 +2664,33 @@ app.get('/api/verify-payment', async (req, res) => {
         tickets.push(ticket);
       }
 
-      // Save booking to database
+      // Create transaction record for event tickets
+      const transaction = {
+        transactionId: sessionId,
+        paymentMethod: 'stripe',
+        amount: session.amount_total / 100,
+        currency: session.currency || 'aed',
+        status: 'completed',
+        stripeSessionId: sessionId,
+        stripePaymentIntentId: session.payment_intent,
+        paymentMethodTypes: session.payment_method_types,
+        transactionType: 'event_ticket',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      // Save transaction to transactions collection
+      const transactionResult = await db.collection('transactions').insertOne(transaction);
+      console.log('Event ticket transaction saved successfully:', transactionResult.insertedId);
+
+      // Save booking to database (without transaction details)
       const booking = {
         sessionId,
+        transactionId: sessionId,
         tickets,
         eventName,
         eventDate,
         eventLocation,
-        amount: session.amount_total / 100, // Convert from fils to AED
-        currency: session.currency || 'aed',
-        paymentMethod: session.payment_method_types?.[0] || 'card',
         purchasedAt: new Date().toISOString(),
         status: 'confirmed',
       };
@@ -1759,20 +2908,20 @@ async function sendNominationConfirmationEmail(email, nomination) {
           <!-- Header -->
           <tr>
             <td style="background: linear-gradient(135deg, #224442 0%, #DBE2CD 100%); padding: 40px 40px 30px; text-align: center;">
-              <h1 style="margin: 0; color: #FFFFFF; font-size: 32px; font-weight: bold;">🏆 Nomination Submitted!</h1>
-              <p style="margin: 10px 0 0; color: #FFFFFF; font-size: 16px;">Thank you for your nomination submission</p>
+              <h1 style="margin: 0; color: #FFFFFF; font-size: 24px; font-weight: bold;">Your Entry Has Been Received</h1>
+              <p style="margin: 10px 0 0; color: #FFFFFF; font-size: 16px;">The Sustainability Excellence Awards 2025</p>
             </td>
           </tr>
 
           <!-- Welcome Message -->
           <tr>
             <td style="padding: 40px; text-align: center;">
-              <h2 style="margin: 0 0 20px; color: #224442; font-size: 24px;">
-                Hello, ${fullName}!
-              </h2>
-              <p style="margin: 0 0 30px; color: #000000; font-size: 16px; line-height: 1.6;">
-                Your nomination has been successfully submitted and payment confirmed. We appreciate your interest in our awards program.
-              </p>
+              <h2 style="margin: 0 0 20px; color: #224442; font-size: 20px;">Hi ${fullName},</h2>
+              <p style="margin: 0 0 15px; color: #000000; font-size: 16px; line-height: 1.6;">Thank you for entering the The Sustainability Excellence Awards 2025.</p>
+              <p style="margin: 0 0 15px; color: #000000; font-size: 16px; line-height: 1.6;">We’ve received your nomination for the ${nomination.category ? nomination.category : '[Award Category]'}.</p>
+              <p style="margin: 0 0 15px; color: #000000; font-size: 16px; line-height: 1.6;">All entries will be reviewed by our expert judging panel, and shortlisted candidates will be contacted shortly.</p>
+              <p style="margin: 0 0 15px; color: #000000; font-size: 16px; line-height: 1.6;">If shortlisted, you’ll also gain access to exclusive editorial and media opportunities across Gulf News platforms — designed to highlight your achievements and innovation in the industry.</p>
+              <p style="margin: 0; color: #000000; font-size: 16px; line-height: 1.6;">We’re excited to have you as part of this first-ever event and look forward to celebrating the region’s sustainability leaders.</p>
             </td>
           </tr>
 
@@ -1837,18 +2986,10 @@ async function sendNominationConfirmationEmail(email, nomination) {
           </tr>
           ` : ''}
 
-          <!-- Next Steps -->
+          <!-- Signature -->
           <tr>
-            <td style="padding: 0 40px 30px;">
-              <div style="background-color: #E7FB7A; border-left: 4px solid #224442; border-radius: 8px; padding: 20px;">
-                <h4 style="margin: 0 0 10px; color: #224442; font-size: 16px;">📋 What Happens Next?</h4>
-                <ul style="margin: 0; padding-left: 20px; color: #000000; font-size: 14px; line-height: 1.8;">
-                  <li>Our judging panel will review all nominations</li>
-                  <li>You'll be notified of the results within 2 weeks</li>
-                  <li>Winners will be announced at the event</li>
-                  <li>All nominees will receive recognition</li>
-                </ul>
-              </div>
+            <td style="padding: 0 40px 30px; text-align: left;">
+              <p style="margin: 0; color: #224442; font-size: 16px; font-weight: 600;">Best regards,<br/>The Sustainability Excellence Awards 2025 Team<br/>Gulf News & BeingShe</p>
             </td>
           </tr>
 
@@ -1874,7 +3015,7 @@ async function sendNominationConfirmationEmail(email, nomination) {
           <!-- Footer -->
           <tr>
             <td style="background-color: #DBE2CD; padding: 30px 40px; text-align: center; border-top: 1px solid #00000040;">
-              <p style="margin: 0 0 10px; color: #224442; font-size: 18px; font-weight: 600;">Good luck with your nomination! 🏆</p>
+              <p style="margin: 0 0 10px; color: #224442; font-size: 18px; font-weight: 600;">Best regards,<br/>The Sustainability Excellence Awards 2025 Team<br/>Gulf News & BeingShe</p>
               <p style="margin: 0; color: #000000; font-size: 12px;">
                 © ${new Date().getFullYear()} Event Nominations. All rights reserved.
               </p>
@@ -1891,7 +3032,7 @@ async function sendNominationConfirmationEmail(email, nomination) {
 
   await sendEmail({
     to: email,
-    subject: '🏆 Nomination Submitted Successfully - Thank You!',
+    subject: 'Your Entry Has Been Received – The Sustainability Excellence Awards 2025',
     html: emailHtml,
   });
 }

@@ -10,7 +10,7 @@ export const sendEmail = async (options) => {
   });
 
   await transporter.sendMail({
-    from: `Event Ticketing <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
+    from: `Gulf News Events 2025 - Sustainability <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
     to: options.to,
     subject: options.subject,
     html: options.html,
